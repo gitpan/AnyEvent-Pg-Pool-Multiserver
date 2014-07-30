@@ -1,13 +1,13 @@
 package AnyEvent::Pg::Pool::Multiserver;
 
-our $VERSION = '0.1';
+our $VERSION = '0.2';
 
 use strict;
 use warnings;
 use utf8;
 use v5.10;
 
-use Carp qw( croak );
+use Carp qw( croak carp );
 use AnyEvent;
 use AnyEvent::Pg::Pool;
 use Future;
@@ -15,7 +15,14 @@ use Params::Validate qw( validate_with );
 
 use fields qw(
   pool
+  local
 );
+
+use Class::XSAccessor {
+  getters => {
+    local => 'local'
+  },
+};
 
 sub new {
   my $class  = shift;
@@ -25,22 +32,25 @@ sub new {
 
   $params = $self->_validate_new( $params );
 
-  my $pool = [];
+  my $pool = {};
 
   foreach my $server ( @{ $params->{servers} } ) {
     my $dbh = AnyEvent::Pg::Pool->new(
       $server->{conn},
       connection_retries => 10,
       connection_delay   => 1,
-      on_error           => sub {},
-      on_transient_error => sub {},
-      on_connect_error   => sub {},
+      size               => 4,
+      on_error           => sub { carp 'Some error'; },
+      on_transient_error => sub { carp 'Transient error'; },
+      on_connect_error   => sub { carp 'Connection error'; },
     );
 
-    push @$pool, { dbh => $dbh, name => $server->{name}, id => $server->{id} };
+    croak 'server_id must be unique' if $pool->{ $server->{id} };
+    $pool->{ $server->{id} } = { dbh => $dbh, name => $server->{name}, id => $server->{id} };
   }
 
   $self->{pool} = $pool;
+  $self->{local} = $params->{local};
 
   return $self;
 }
@@ -53,6 +63,7 @@ sub _validate_new {
     params => $params,
     spec => {
       servers => 1,
+      local   => 1,
     },
   );
 
@@ -67,39 +78,51 @@ sub selectall_arrayref {
 
   my @futures = ();
 
-  foreach my $server ( @{ $self->{pool} } ) {
+  my @pool = ();
+  if ( defined $params->{server_id} ) {
+    push @pool, $params->{server_id};
+  }
+  else {
+    @pool = keys %{ $self->{pool} };
+  }
+
+  foreach my $server_id ( @pool ) {
+    my $server = $self->{pool}{ $server_id };
+
     push @futures, $self->_get_future_push_query(
-      query  => $params->{query},
-      args   => $params->{args},
-      server => $server,
+      query     => $params->{query},
+      args      => $params->{args},
+      server    => $server,
+      cb_server => $params->{cb_server},
+      type      => 'selectall_arrayref_slice',
     );
   }
 
   my $main_future = Future->wait_all( @futures );
   $main_future->on_done( sub {
-    my $results = [];
-    my $errors  = [];
+    my @results = ();
+    my @errors  = ();
 
     foreach my $future ( @futures ) {
       my ( $server, $result, $error ) = $future->get();
 
-      if ( !$error && $result  ) {
-        if ( $result->nRows ) {
-          foreach my $row ( $result->rowsAsHashes ) {
-            $row->{_server_id} = $server->{id};
-            push @$results, $row;
-          }
-        }
+      if ( !$error ) {
+        push @results, @$result;
       }
       else {
-        push @$errors, {
-          name => $server->{name},
-          id   => $server->{id},
+        push @errors, {
+          server_name => $server->{name},
+          server_id   => $server->{id},
+          error       => $error,
         };
       }
     }
 
-    $params->{cb}->( $results, $errors );
+    $params->{cb}->(
+      scalar( @results ) ? [ @results ] : undef,
+      scalar( @errors ) ? [ @errors ] : undef,
+    );
+
     undef $main_future;
   } );
 
@@ -113,9 +136,11 @@ sub _validate_selectall_arrayref {
   $params = validate_with(
     params => $params,
     spec => {
-      query => 1,
-      args  => 0,
-      cb    => 1,
+      query     => 1,
+      args      => 0,
+      cb        => 1,
+      server_id => 0,
+      cb_server => 0,
     },
   );
 
@@ -130,11 +155,12 @@ sub _get_future_push_query {
 
   my $watcher;
 
-  $watcher = $params->{server}->{dbh}->push_query(
+  $watcher = $params->{server}{dbh}->push_query(
     query => $params->{query},
     args  => $params->{args},
     on_error => sub {
-      $future->done( $params->{server}, undef, 1 );
+      carp shift;
+      $future->done( $params->{server}, undef, 'Push error' );
       undef $watcher;
     },
     on_result => sub {
@@ -142,12 +168,251 @@ sub _get_future_push_query {
       my $w   = shift;
       my $res = shift;
 
-      $future->done( $params->{server}, $res );
-      undef $watcher;
+      if ( $res->errorMessage ) {
+        carp $res->errorMessage;
+        $future->done( $params->{server}, undef, $res->errorMessage );
+        undef $watcher;
+        return;
+      }
+
+      my $result;
+
+      if ( $params->{type} eq 'selectall_arrayref_slice' ) {
+        $result = _fetchall_arrayref_slice( $params->{server}{id}, $res );
+      }
+      elsif ( $params->{type} eq 'selectrow_hashref' ) {
+        $result = _fetchrow_hashref( $params->{server}{id}, $res );
+      }
+      elsif ( $params->{type} eq 'selectrow_array' ) {
+        $result = _fetchrow_array( $params->{server}{id}, $res );
+      }
+      elsif ( $params->{type} eq 'do' ) {
+        $result = _fetch_do( $params->{server}{id}, $res );
+      }
+
+      my $cb = sub {
+        $future->done( $params->{server}, $result );
+        undef $watcher;
+      };
+
+      if ( $params->{cb_server} ) {
+        $params->{cb_server}->( result => $result, cb => $cb );
+      }
+      else {
+        $cb->();
+      }
     },
   );
 
   return $future;
+}
+
+sub _fetchall_arrayref_slice {
+  my $id  = shift;
+  my $res = shift;
+
+  my $result = [];
+
+  if ( $res->nRows ) {
+    foreach my $row ( $res->rowsAsHashes ) {
+      $row->{_server_id} = $id;
+      push @$result, $row;
+    }
+  }
+
+  return $result;
+}
+
+sub _fetchrow_hashref {
+  my $id  = shift;
+  my $res = shift;
+
+  my $result;
+
+  if ( $res->nRows ) {
+    $result = $res->rowAsHash(0);
+    $result->{_server_id} = $id;
+  }
+
+  return $result;
+}
+
+sub _fetchrow_array {
+  my $id  = shift;
+  my $res = shift;
+
+  my $result;
+
+  if ( $res->nRows ) {
+    $result = [ $id, $res->row(0) ];
+  }
+
+  return $result;
+}
+
+sub _fetch_do {
+  my $id  = shift;
+  my $res = shift;
+
+  # TODO return real result
+
+  return [ $id, 1 ];
+}
+
+sub selectrow_hashref {
+  my __PACKAGE__ $self = shift;
+  my $params = {@_};
+
+  $params = $self->_validate_selectrow_hashref( $params );
+
+  my $future = $self->_get_future_push_query(
+    query     => $params->{query},
+    args      => $params->{args},
+    server    => $self->{pool}{ $params->{server_id} },
+    cb_server => $params->{cb_server},
+    type      => 'selectrow_hashref',
+  );
+
+  $future->on_done( sub {
+    my ( $server, $result, $error ) = $future->get();
+
+    if ( !$error ) {
+      $params->{cb}->( $result, undef );
+    }
+    else {
+      $params->{cb}->( undef, {
+        server_name => $server->{name},
+        server_id   => $server->{id},
+        error       => $error,
+      } );
+    }
+
+    undef $future;
+  } );
+
+  return;
+}
+
+sub _validate_selectrow_hashref {
+  my __PACKAGE__ $self = shift;
+  my $params = shift;
+
+  $params = validate_with(
+    params => $params,
+    spec => {
+      query     => 1,
+      args      => 0,
+      cb        => 1,
+      server_id => 1,
+      cb_server => 0,
+    },
+  );
+
+  return $params;
+}
+
+sub selectrow_array {
+  my __PACKAGE__ $self = shift;
+  my $params = {@_};
+
+  $params = $self->_validate_selectrow_array( $params );
+
+  my $future = $self->_get_future_push_query(
+    query     => $params->{query},
+    args      => $params->{args},
+    server    => $self->{pool}{ $params->{server_id} },
+    cb_server => $params->{cb_server},
+    type      => 'selectrow_array',
+  );
+
+  $future->on_done( sub {
+    my ( $server, $result, $error ) = $future->get();
+
+    if ( !$error ) {
+      $params->{cb}->( $result, undef );
+    }
+    else {
+      $params->{cb}->( undef, {
+        server_name => $server->{name},
+        server_id   => $server->{id},
+        error       => $error,
+      } );
+    }
+
+    undef $future;
+  } );
+
+  return;
+}
+
+sub _validate_selectrow_array {
+  my __PACKAGE__ $self = shift;
+  my $params = shift;
+
+  $params = validate_with(
+    params => $params,
+    spec => {
+      query     => 1,
+      args      => 0,
+      cb        => 1,
+      server_id => 1,
+      cb_server => 0,
+    },
+  );
+
+  return $params;
+}
+
+sub do {
+  my __PACKAGE__ $self = shift;
+  my $params = {@_};
+
+  $params = $self->_validate_do( $params );
+
+  my $future = $self->_get_future_push_query(
+    query     => $params->{query},
+    args      => $params->{args},
+    server    => $self->{pool}{ $params->{server_id} },
+    cb_server => $params->{cb_server},
+    type      => 'do',
+  );
+
+  $future->on_done( sub {
+    my ( $server, $result, $error ) = $future->get();
+
+    if ( !$error ) {
+      $params->{cb}->( $result, undef );
+    }
+    else {
+      $params->{cb}->( undef, {
+        server_name => $server->{name},
+        server_id   => $server->{id},
+        error       => $error,
+      } );
+    }
+
+    undef $future;
+  } );
+
+  return;
+}
+
+sub _validate_do {
+  my __PACKAGE__ $self = shift;
+  my $params = shift;
+
+  $params = validate_with(
+    params => $params,
+    spec => {
+      query     => 1,
+      args      => 0,
+      cb        => 1,
+      server_id => 1,
+      cb_server => 0,
+    },
+  );
+
+  return $params;
 }
 
 1;
@@ -157,9 +422,6 @@ sub _get_future_push_query {
 AnyEvent::Pg::Pool::Multiserver - Asyncronious multiserver requests to Postgresql with AnyEvent::Pg
 
 =head1 SYNOPSIS
-
-  use AnyEvent;
-  use AnyEvent::Pg::Pool::Multiserver;
 
   my $servers = [
     {
@@ -173,45 +435,164 @@ AnyEvent::Pg::Pool::Multiserver - Asyncronious multiserver requests to Postgresq
       conn => 'host=remote2 port=5432 dbname=mydb user=myuser password=mypass',
     },
   ];
-  my $pool = AnyEvent::Pg::Pool::Multiserver->new( servers => $servers );
+  my $pool = AnyEvent::Pg::Pool::Multiserver->new( servers => $servers, local => 1 );
 
-  my $cv = AE::cv;
+  # multi-server request
 
-  # query and args same as in AnyEvent::Pg
   $pool->selectall_arrayref(
     query  => 'SELECT val FROM ( SELECT 1 AS val ) tmp WHERE tmp.val = $1;',
-    args   => [1],
+    args   => [ 1 ],
     cb     => sub {
-      my $result = shift;
-      my $err    = shift;
+      my $results = shift;
+      my $errors  = shift;
 
-      if ( $err ) {
-        foreach my $srv ( @$err ) {
-          say "err with $srv->{name} $srv->{id}";
+      if ( $errors ) {
+        foreach my $srv ( @$errors ) {
+          say "err $srv->{error} with $srv->{server_name} $srv->{server_id}";
         }
       }
 
-      if ( $result ) {
-        foreach my $val ( @$result ) {
+      if ( $results ) {
+        foreach my $val ( @$results ) {
           say "server_id=$val->{_server_id} value=$val->{val}";
         }
       }
-
-      $cv->send;
     },
   );
 
-  $cv->recv;
+  # single-server request
+
+  $pool->selectall_arrayref(
+    query     => 'SELECT val FROM ( SELECT 1 AS val ) tmp WHERE tmp.val = $1;',
+    args      => [ 1 ],
+    server_id => 1,
+    cb        => sub { ... },
+  );
+
+  # multi-server request with sub-callbacks to some data manipulation
+  # and may be to make another request to current server
+
+  # main request | server_1 select -> ... select end -> cb_server call -> subrequests to current server | wait both   | global callback
+  #              | server_2 select -> ... select end -> cb_server call -> subrequests to current server | subrequests |
+
+  $pool->selectall_arrayref(
+    query  => 'SELECT val FROM ( SELECT 1 AS val ) tmp WHERE tmp.val = $1;',
+    args   => [ 1 ],
+    cb     => sub { ... },
+    cb_server => sub {
+      my $params = { @_ };
+
+      my $result_of_main_request = $params->{result};
+
+      # Now we can do some sub-request to current server
+
+      # And MUST call cb
+      $params->{cb}->();
+    },
+  );
+
+  # single-server request to select row in arrayref
+
+  $pool->selectrow_array(
+    query     => 'SELECT val FROM ( SELECT 1 AS val ) tmp WHERE tmp.val = $1;',
+    args      => [ 1 ],
+    server_id => 1,
+    cb        => sub {
+      my $result = shift;
+      my $error  = shift;
+
+      if ( $error ) {
+        say "err $error->{error} with $error->{server_name} $error->{server_id}";
+      }
+
+      if ( $result ) {
+        say "server_id=$result->[ 0 ] value=$result->[ 1 ]";
+      }
+    },
+  );
+
+  # single-server request to select row in hashref
+
+  $pool->selectrow_hashref(
+    query     => 'SELECT val FROM ( SELECT 1 AS val ) tmp WHERE tmp.val = $1;',
+    args      => [ 1 ],
+    server_id => 1,
+    cb        => sub {
+      my $result = shift;
+      my $error  = shift;
+
+      if ( $error ) {
+        say "err $error->{error} with $error->{server_name} $error->{server_id}";
+      }
+
+      if ( $result ) {
+        say "server_id=$result->{_server_id} value=$result->{val}";
+      }
+    },
+  );
+
+  # single-server request to do something
+
+  $pool->do(
+    query     => 'UPDATE table SET column = 1 WHERE id = $1;',
+    args      => [ 1 ],
+    server_id => 1,
+    cb        => sub {
+      my $result = shift;
+      my $error  = shift;
+
+      if ( $error ) {
+        say "err $error->{error} with $error->{server_name} $error->{server_id}";
+      }
+
+      if ( $result ) {
+        say "server_id=$result->[ 0 ] updated=$result->[ 1 ]";
+      }
+    },
+  );
+
+  # local-server request to do something
+
+  $pool->do(
+    query     => 'UPDATE table SET column = 1 WHERE id = $1;',
+    args      => [ 1 ],
+    server_id => $pool->local(),
+    cb        => sub { ... },
+  );
 
 =head1 DESCRIPTION
 
-=head2 $pool->selectall_arrayref
+=head2 selectall_arrayref
 
 query and args are the same, that in AnyEvent::Pg
 
+Required: query, cb
+Optional: args, cb_server, server_id
+
+=head2 selectrow_array
+
+query and args are the same, that in AnyEvent::Pg
+
+Required: query, server_id, cb
+Optional: args, cb_server
+
+=head2 selectrow_hashref
+
+query and args are the same, that in AnyEvent::Pg
+
+Required: query, server_id, cb
+Optional: args, cb_server
+
+=head2 do
+
+query and args are the same, that in AnyEvent::Pg
+
+Required: query, server_id, cb
+Optional: args, cb_server
+
 =head1 SOURCE AVAILABILITY
 
-The source code for this module is available from Github
+The source code for this module is available
 at L<Github|https://github.com/kak-tus/AnyEvent-Pg-Pool-Multiserver>
 
 =head1 AUTHOR
