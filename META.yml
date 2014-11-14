@@ -23,4 +23,4 @@ requires:
   Class::XSAccessor: 1.19
   Future: 0.27
   Params::Validate: 1.10
-version: 0.2
+version: 0.3
